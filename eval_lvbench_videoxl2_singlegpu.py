@@ -145,7 +145,11 @@ def inference_lvbench(args):
     model.to(device)
 
     lvbench = load_lvbench(args.data_root)
-    if not os.path.exists(args.output_dir):
+    # Shard the evaluation set across all available processes so that multiple GPUs can
+    # run inference in parallel when launched with `accelerate launch`.
+    lvbench_shard = accelerator.split_between_processes(lvbench)
+
+    if accelerator.is_main_process and not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir, exist_ok=True)
     output_path = os.path.join(args.output_dir, f"{args.output_name}.jsonl")
 
@@ -158,56 +162,71 @@ def inference_lvbench(args):
         "max_new_tokens": args.max_new_tokens,
     }
 
-    with open(output_path, "w", encoding="utf-8") as writer:
-        for example in tqdm(lvbench):
-            if not os.path.exists(example["video_path"]):
-                continue
+    local_results = []
+    progress = tqdm(lvbench_shard, disable=not accelerator.is_local_main_process)
+    for example in progress:
+        if not os.path.exists(example["video_path"]):
+            continue
 
-            frames, timestamps = load_video(
-                example["video_path"],
-                args.max_frame_num,
-                fps=args.fps,
-                max_fps=args.max_fps,
+        frames, timestamps = load_video(
+            example["video_path"],
+            args.max_frame_num,
+            fps=args.fps,
+            max_fps=args.max_fps,
+        )
+        frame_tensor = image_processor.preprocess(frames, return_tensors="pt")[
+            "pixel_values"
+        ].to(device, dtype=torch.float16)
+        time_embedding = prepare_time_embedding(timestamps, tokenizer)
+
+        stop_str = conv_templates[args.conv_template].sep
+        if conv_templates[args.conv_template].sep_style == SeparatorStyle.TWO:
+            stop_str = conv_templates[args.conv_template].sep2
+        for qa in example["QA"]:
+            final_prompt = args.root_prompt + "\n" + qa["question"] + "\n"
+            prompt = build_prompt(
+                args.conv_template, final_prompt, frame_tensor.shape[1], args.token_strategy
             )
-            frame_tensor = image_processor.preprocess(frames, return_tensors="pt")[
-                "pixel_values"
-            ].to(device, dtype=torch.float16)
-            time_embedding = prepare_time_embedding(timestamps, tokenizer)
+            input_ids = tokenizer_image_token(
+                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+            ).to(device)
 
-            stop_str = conv_templates[args.conv_template].sep
-            if conv_templates[args.conv_template].sep_style == SeparatorStyle.TWO:
-                stop_str = conv_templates[args.conv_template].sep2
-            for qa in example["QA"]:
-                final_prompt = args.root_prompt + "\n" + qa["question"] + "\n"
-                prompt = build_prompt(
-                    args.conv_template, final_prompt, frame_tensor.shape[1], args.token_strategy
-                )
-                input_ids = tokenizer_image_token(
-                    prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
-                ).to(device)
+            pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+            attention_masks = input_ids.ne(pad_token_id).to(device)
+            stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
 
-                pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-                attention_masks = input_ids.ne(pad_token_id).to(device)
-                stopping_criteria = KeywordsStoppingCriteria([stop_str], tokenizer, input_ids)
+            model.config.mm_spatial_pool_stride = args.mm_spatial_pool_stride
+            model.config.mm_spatial_pool_mode = args.mm_spatial_pool_mode
 
-                model.config.mm_spatial_pool_stride = args.mm_spatial_pool_stride
-                model.config.mm_spatial_pool_mode = args.mm_spatial_pool_mode
+            outputs = model.generate(
+                input_ids,
+                attention_mask=attention_masks,
+                images=[frame_tensor],
+                time_embedding=[t.to(device) for t in time_embedding],
+                modalities=["video"],
+                stopping_criteria=[stopping_criteria],
+                **gen_kwargs,
+            )
+            trimmed = outputs[:, input_ids.shape[1] :]
+            text = tokenizer.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
-                outputs = model.generate(
-                    input_ids,
-                    attention_mask=attention_masks,
-                    images=[frame_tensor],
-                    time_embedding=[t.to(device) for t in time_embedding],
-                    modalities=["video"],
-                    stopping_criteria=[stopping_criteria],
-                    **gen_kwargs,
-                )
-                trimmed = outputs[:, input_ids.shape[1] :]
-                text = tokenizer.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
-                qa["pred"] = text
-                writer.write(json.dumps({"video": example["video"], "qa": qa}, ensure_ascii=False) + "\n")
+            qa_with_pred = qa.copy()
+            qa_with_pred["pred"] = text
+            local_results.append({"video": example["video"], "qa": qa_with_pred})
 
-    accelerator.print(f"Predictions saved to {output_path}")
+    gathered_results = accelerator.gather_object(local_results)
+
+    if accelerator.is_main_process:
+        # Flatten gathered results since gather_object returns a list per process.
+        flat_results = []
+        for worker_results in gathered_results:
+            flat_results.extend(worker_results)
+
+        with open(output_path, "w", encoding="utf-8") as writer:
+            for record in flat_results:
+                writer.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        accelerator.print(f"Predictions saved to {output_path}")
 
 
 def build_root_prompt(prompt_choice: str) -> str:
