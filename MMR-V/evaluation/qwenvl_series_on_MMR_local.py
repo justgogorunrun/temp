@@ -71,6 +71,7 @@ def parse_args() -> argparse.Namespace:
         help="Output JSON path for predictions.",
     )
     parser.add_argument("--max-frames", type=int, default=8)
+    parser.add_argument("--max-pixels", type=int, default=448*448)
     parser.add_argument("--fps", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--attn-impl", default="flash_attention_2")
@@ -126,6 +127,7 @@ def main() -> None:
                         "type": "video",
                         "video": video_path,
                         "max_frames": args.max_frames,
+                        "max_pixels": args.max_pixels,
                         "fps": args.fps,
                     },
                     {"type": "text", "text": prompt},
