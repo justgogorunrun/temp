@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 from statistics import mean, median
 from typing import Any, Dict, List, Sequence, Tuple
 
 import cv2
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from shot_segmentation import DINOv3ShotSegmenter
@@ -152,7 +154,7 @@ def process_one_record(record: Dict[str, Any], segmenter: DINOv3ShotSegmenter, v
 def process_subset(
     rank: int,
     gpu_id: int,
-    subset: Sequence[Dict[str, Any]],
+    subset: Sequence[Tuple[int, Dict[str, Any]]],
     video_root: str,
     video_id_key: str,
     video_suffix: str,
@@ -161,6 +163,8 @@ def process_subset(
     min_shot_len: int,
     batch_size: int,
     visualize: bool,
+    sample_fps: float,
+    min_sampled_frames: int,
     queue: mp.Queue,
 ) -> None:
     segmenter = DINOv3ShotSegmenter(
@@ -170,22 +174,76 @@ def process_subset(
         batch_size=batch_size,
         device=f"cuda:{gpu_id}" if torch.cuda.is_available() else "cpu",
         visualize=visualize,
+        sample_fps=sample_fps,
+        min_sampled_frames=min_sampled_frames,
     )
 
     outputs: List[Tuple[int, Dict[str, Any]]] = []
     root = Path(video_root)
 
-    for i, item in enumerate(tqdm(subset, desc=f"GPU-{gpu_id}", position=rank, leave=True)):
-        outputs.append((i, process_one_record(item, segmenter, root, video_id_key, video_suffix)))
+    for idx, item in tqdm(subset, desc=f"GPU-{gpu_id}", position=rank, leave=True):
+        outputs.append((idx, process_one_record(item, segmenter, root, video_id_key, video_suffix)))
 
     queue.put((rank, outputs))
 
 
-def split_even(items: Sequence[Dict[str, Any]], parts: int) -> List[List[Dict[str, Any]]]:
+def split_even(items: Sequence[Tuple[int, Dict[str, Any]]], parts: int) -> List[List[Tuple[int, Dict[str, Any]]]]:
     chunks = [[] for _ in range(parts)]
     for i, item in enumerate(items):
         chunks[i % parts].append(item)
     return chunks
+
+
+def run_distributed_mode(args: argparse.Namespace, records: List[Dict[str, Any]], schema: Dict[str, Any]) -> None:
+    world_size = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+        else:
+            device = "cpu"
+
+        indexed_records = list(enumerate(records))
+        local_subset = indexed_records[rank::world_size]
+
+        segmenter = DINOv3ShotSegmenter(
+            model_name=args.model_name,
+            threshold=args.threshold,
+            min_shot_len=args.min_shot_len,
+            batch_size=args.batch_size,
+            device=device,
+            visualize=args.visualize,
+            sample_fps=args.sample_fps,
+            min_sampled_frames=args.min_sampled_frames,
+        )
+
+        root = Path(args.video_root)
+        local_outputs: List[Tuple[int, Dict[str, Any]]] = []
+        for idx, item in tqdm(local_subset, desc=f"RANK-{rank}", position=local_rank, leave=True):
+            local_outputs.append((idx, process_one_record(item, segmenter, root, args.video_id_key, args.video_suffix)))
+
+        gathered_outputs: List[List[Tuple[int, Dict[str, Any]]]] | None = [None for _ in range(world_size)] if rank == 0 else None
+        dist.gather_object(local_outputs, gathered_outputs, dst=0)
+
+        if rank == 0 and gathered_outputs is not None:
+            merged = [pair for part in gathered_outputs for pair in part]
+            out_records = [record for _, record in sorted(merged, key=lambda x: x[0])]
+            dataset_stats = summarize_dataset(out_records)
+            dump_records(out_records, args.output_json, schema, dataset_stats)
+            stats_path = dump_dataset_stats(args.output_json, dataset_stats)
+
+            print_dataset_summary(dataset_stats)
+            print(f"Saved updated records to: {args.output_json}")
+            print(f"Saved dataset stats to: {stats_path}")
+    finally:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _safe_mean(values: List[float]) -> float:
@@ -271,9 +329,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-suffix", default=".mp4", help="video file suffix, e.g. .mp4")
     parser.add_argument("--model-name", default="/mnt/bn/laion400m/zhangkc/dinov3-vit7b16-pretrain-lvd1689m")
     parser.add_argument("--threshold", type=float, default=0.60)
-    parser.add_argument("--min-shot-len", type=int, default=2)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--min-shot-len", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=6)
     parser.add_argument("--num-gpus", type=int, default=8, help="How many GPUs to use; default is all visible GPUs")
+    parser.add_argument("--sample-fps", type=float, default=2.0, help="Primary frame sampling fps")
+    parser.add_argument("--min-sampled-frames", type=int, default=256, help="Fallback uniform sampled frame count")
     parser.add_argument("--visualize", action="store_true", help="Enable visualization mode")
     return parser.parse_args()
 
@@ -293,6 +353,10 @@ def main() -> None:
     if args.video_id_key not in records[0]:
         raise KeyError(f"video_id key '{args.video_id_key}' not found in input records")
 
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        run_distributed_mode(args, records, schema)
+        return
+
     available_gpus = torch.cuda.device_count()
     if available_gpus == 0:
         print("CUDA is unavailable, fallback to single-process CPU mode.")
@@ -303,6 +367,8 @@ def main() -> None:
             batch_size=args.batch_size,
             device="cpu",
             visualize=args.visualize,
+            sample_fps=args.sample_fps,
+            min_sampled_frames=args.min_sampled_frames,
         )
         out_records = []
         for record in tqdm(records, desc="CPU"):
@@ -328,7 +394,8 @@ def main() -> None:
     num_workers = max(1, min(num_workers, available_gpus, len(records)))
     gpu_ids = list(range(num_workers))
 
-    chunks = split_even(records, num_workers)
+    indexed_records = list(enumerate(records))
+    chunks = split_even(indexed_records, num_workers)
     queue: mp.Queue = mp.Queue()
 
     procs: List[mp.Process] = []
@@ -347,27 +414,24 @@ def main() -> None:
                 args.min_shot_len,
                 args.batch_size,
                 args.visualize,
+                args.sample_fps,
+                args.min_sampled_frames,
                 queue,
             ),
         )
         p.start()
         procs.append(p)
 
-    gathered: List[List[Dict[str, Any]]] = [None] * num_workers  # type: ignore[list-item]
+    gathered: List[List[Tuple[int, Dict[str, Any]]]] = [None] * num_workers  # type: ignore[list-item]
     for _ in range(num_workers):
         rank, outputs = queue.get()
-        outputs = [record for _, record in sorted(outputs, key=lambda x: x[0])]
         gathered[rank] = outputs
 
     for p in procs:
         p.join()
 
-    out_records: List[Dict[str, Any]] = []
-    max_len = max(len(x) for x in gathered)
-    for i in range(max_len):
-        for worker_records in gathered:
-            if i < len(worker_records):
-                out_records.append(worker_records[i])
+    merged = [pair for worker_outputs in gathered for pair in worker_outputs]
+    out_records = [record for _, record in sorted(merged, key=lambda x: x[0])]
 
     dataset_stats = summarize_dataset(out_records)
     dump_records(out_records, args.output_json, schema, dataset_stats)
